@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>熔断器状态回放</title>
+<style>
+  :root {
+    --bg: #0f1420; --panel: #1a2132; --border: #2a3550; --text: #dbe2f0;
+    --muted: #8a94ad; --closed: #2fbf71; --open: #e5484d; --half: #f5a524;
+    --accent: #5b8def;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px; background: var(--bg); color: var(--text);
+    font-family: -apple-system, "PingFang SC", "Helvetica Neue", sans-serif;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 16px; }
+  .tabs { display: flex; gap: 8px; margin-bottom: 12px; }
+  .tabs button {
+    background: var(--panel); color: var(--muted); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 14px; cursor: pointer; font-size: 13px;
+  }
+  .tabs button.active { color: var(--text); border-color: var(--accent); }
+  .panel {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 16px; margin-bottom: 12px;
+  }
+  canvas { width: 100%; height: 320px; display: block; }
+  .controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .controls button, .controls select {
+    background: var(--panel); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 12px; cursor: pointer; font-size: 13px;
+  }
+  .controls input[type=range] { flex: 1; min-width: 160px; accent-color: var(--accent); }
+  .stats { display: flex; gap: 24px; flex-wrap: wrap; font-size: 13px; }
+  .stats .item b { display: block; font-size: 18px; margin-top: 2px; }
+  .badge {
+    display: inline-block; padding: 2px 10px; border-radius: 999px;
+    font-weight: 600; font-size: 13px; color: #0f1420;
+  }
+  .note { color: var(--half); min-height: 18px; font-size: 13px; }
+  .transitions { font-size: 13px; color: var(--muted); }
+  .transitions a { color: var(--accent); cursor: pointer; text-decoration: none; }
+  .transitions a:hover { text-decoration: underline; }
+  .legend { display: flex; gap: 16px; font-size: 12px; color: var(--muted); margin-top: 8px; flex-wrap: wrap; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; }
+</style>
+</head>
+<body>
+<h1>熔断器状态机回放</h1>
+<div class="sub" id="cfgline"></div>
+<div class="tabs" id="tabs"></div>
+<div class="panel"><canvas id="cv"></canvas>
+  <div class="legend">
+    <span><span class="dot" style="background:var(--closed)"></span>关闭</span>
+    <span><span class="dot" style="background:var(--half)"></span>半开</span>
+    <span><span class="dot" style="background:var(--open)"></span>打开</span>
+    <span>● 绿=成功 红=失败 灰=被拒绝</span>
+    <span>┄ 虚线=错误率阈值</span>
+    <span>┊ 竖线=状态切换</span>
+  </div>
+</div>
+<div class="panel controls">
+  <button id="btnPlay">▶ 播放</button>
+  <button id="btnPrev">‹ 上一帧</button>
+  <button id="btnNext">下一帧 ›</button>
+  <select id="speed">
+    <option value="0.5">0.5×</option>
+    <option value="1" selected>1×</option>
+    <option value="2">2×</option>
+    <option value="4">4×</option>
+  </select>
+  <input type="range" id="slider" min="0" max="1000" value="0">
+  <span id="clock" style="font-variant-numeric:tabular-nums;font-size:13px"></span>
+</div>
+<div class="panel">
+  <div class="stats">
+    <div class="item">状态<br><span class="badge" id="stState"></span></div>
+    <div class="item">窗口请求数<b id="stTotal"></b></div>
+    <div class="item">窗口失败数<b id="stFail"></b></div>
+    <div class="item">错误率（增量 / 全量校验）<b id="stRate"></b></div>
+    <div class="item">半开在途探测<b id="stFlight"></b></div>
+  </div>
+  <div class="note" id="stNote" style="margin-top:10px"></div>
+</div>
+<div class="panel transitions" id="transitions"></div>
+<script id="data" type="application/json">__DATA__</script>
+<script>
+"use strict";
+const DATA = JSON.parse(document.getElementById("data").textContent);
+const COLORS = { "CLOSED": "#2fbf71", "OPEN": "#e5484d", "HALF-OPEN": "#f5a524" };
+
+let inst = 0, playhead = 0, playing = false, speed = 1, lastTs = null;
+
+const $ = id => document.getElementById(id);
+const cv = $("cv"), ctx = cv.getContext("2d");
+
+document.getElementById("cfgline").textContent =
+  `错误率阈值 ${(DATA.threshold*100).toFixed(0)}% · 最小样本数 ${DATA.minSamples} · 冷却 ${DATA.cooldownMs}ms`;
+
+function getInstances() { return DATA.instances || DATA.Instances; }
+function getFrames() { return getInstances()[inst].frames; }
+function maxT() { const f = getFrames(); return f[f.length - 1].t; }
+
+// 找到 playhead 对应的帧下标（最后一个 t <= playhead 的帧）
+function frameAt(t) {
+  const f = getFrames();
+  let lo = 0, hi = f.length - 1, ans = 0;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (f[mid].t <= t) { ans = mid; lo = mid + 1; } else hi = mid - 1;
+  }
+  return ans;
+}
+
+function buildTabs() {
+  const tabs = $("tabs"); tabs.innerHTML = "";
+  getInstances().forEach((ins, i) => {
+    const b = document.createElement("button");
+    b.textContent = ins.name;
+    if (i === inst) b.className = "active";
+    b.onclick = () => { inst = i; playhead = 0; buildTabs(); buildTransitions(); render(); };
+    tabs.appendChild(b);
+  });
+}
+
+function buildTransitions() {
+  const el = $("transitions");
+  const marks = getFrames().filter(f => f.note);
+  el.innerHTML = "<b>状态切换时刻：</b> " + marks.map(f =>
+    `<a data-t="${f.t}">${(f.t/1000).toFixed(1)}s ${f.note}</a>`).join(" · ");
+  el.querySelectorAll("a").forEach(a => a.onclick = () => { playhead = +a.dataset.t; render(); });
+}
+
+function resize() {
+  const r = cv.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+  cv.width = r.width * dpr; cv.height = 320 * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener("resize", () => { resize(); render(); });
+
+function render() {
+  const F = getFrames();
+  const idx = frameAt(playhead);
+  const cur = F[idx];
+  const W = cv.getBoundingClientRect().width, H = 320;
+  const padL = 44, padR = 12, padT = 34, padB = 26;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  const T = maxT();
+  const X = t => padL + (t / T) * plotW;
+  const Y = r => padT + (1 - r) * plotH;
+
+  ctx.clearRect(0, 0, W, H);
+
+  // 顶部状态色带
+  const bandH = 14;
+  for (let i = 0; i < F.length - 1; i++) {
+    if (F[i].t > playhead) break;
+    ctx.fillStyle = COLORS[F[i].state];
+    ctx.fillRect(X(F[i].t), 6, Math.max(1, X(F[i+1].t) - X(F[i].t)), bandH);
+  }
+
+  // 阈值虚线
+  ctx.strokeStyle = "#8a94ad"; ctx.setLineDash([5, 4]); ctx.beginPath();
+  ctx.moveTo(padL, Y(DATA.threshold)); ctx.lineTo(W - padR, Y(DATA.threshold));
+  ctx.stroke(); ctx.setLineDash([]);
+  ctx.fillStyle = "#8a94ad"; ctx.font = "11px sans-serif";
+  ctx.fillText((DATA.threshold*100).toFixed(0) + "%", 6, Y(DATA.threshold) + 4);
+  ctx.fillText("0%", 6, Y(0) + 4); ctx.fillText("100%", 6, Y(1) + 4);
+
+  // 状态切换竖线（高亮触发时刻）
+  for (const f of F) {
+    if (!f.note || f.t > playhead) continue;
+    ctx.strokeStyle = "rgba(245,165,36,.55)"; ctx.beginPath();
+    ctx.moveTo(X(f.t), padT - 6); ctx.lineTo(X(f.t), padT + plotH); ctx.stroke();
+  }
+
+  // 错误率曲线（增量 + 全量校验线重合绘制）
+  const drawLine = (key, color, width) => {
+    ctx.strokeStyle = color; ctx.lineWidth = width; ctx.beginPath();
+    let started = false;
+    for (const f of F) {
+      if (f.t > playhead) break;
+      const x = X(f.t), y = Y(f[key]);
+      if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+    }
+    ctx.stroke(); ctx.lineWidth = 1;
+  };
+  drawLine("fullRate", "rgba(138,148,173,.8)", 3); // 全量重算：粗灰底
+  drawLine("rate", "#5b8def", 1.5);                // 增量统计：蓝线压在上面
+
+  // 事件点
+  for (const f of F) {
+    if (f.t > playhead || !f.kind) break;
+    if (f.kind === "reject") {
+      ctx.fillStyle = "#6b748c";
+      ctx.beginPath(); ctx.arc(X(f.t), padT + plotH - 4, 3, 0, 7); ctx.fill();
+    } else {
+      ctx.fillStyle = f.kind === "ok" ? "#2fbf71" : "#e5484d";
+      ctx.beginPath(); ctx.arc(X(f.t), Y(f.rate), 3, 0, 7); ctx.fill();
+    }
+  }
+
+  // 播放头
+  ctx.strokeStyle = "#dbe2f0"; ctx.beginPath();
+  ctx.moveTo(X(playhead), padT - 6); ctx.lineTo(X(playhead), padT + plotH); ctx.stroke();
+
+  // 信息面板
+  const badge = $("stState");
+  badge.textContent = cur.state;
+  badge.style.background = COLORS[cur.state];
+  $("stTotal").textContent = cur.total;
+  $("stFail").textContent = cur.fail;
+  $("stRate").textContent =
+    (cur.rate*100).toFixed(1) + "% / " + (cur.fullRate*100).toFixed(1) + "%";
+  $("stFlight").textContent = cur.inFlight;
+  $("stNote").textContent = cur.note ? "⚡ " + cur.note : "";
+  $("clock").textContent = (playhead/1000).toFixed(1) + "s / " + (T/1000).toFixed(1) + "s";
+  $("slider").value = T ? Math.round(playhead / T * 1000) : 0;
+}
+
+function tick(ts) {
+  if (!playing) return;
+  if (lastTs == null) lastTs = ts;
+  playhead += (ts - lastTs) * speed;
+  lastTs = ts;
+  if (playhead >= maxT()) { playhead = maxT(); pause(); }
+  render();
+  requestAnimationFrame(tick);
+}
+function play() { playing = true; lastTs = null; $("btnPlay").textContent = "⏸ 暂停"; requestAnimationFrame(tick); }
+function pause() { playing = false; $("btnPlay").textContent = "▶ 播放"; }
+
+$("btnPlay").onclick = () => {
+  if (playing) { pause(); return; }
+  if (playhead >= maxT()) playhead = 0;
+  play();
+};
+$("btnPrev").onclick = () => { pause(); const i = frameAt(playhead); const F = getFrames(); playhead = F[Math.max(0, i - 1)].t; render(); };
+$("btnNext").onclick = () => { pause(); const i = frameAt(playhead); const F = getFrames(); playhead = F[Math.min(F.length - 1, i + 1)].t; render(); };
+$("speed").onchange = e => speed = +e.target.value;
+$("slider").oninput = e => { pause(); playhead = e.target.value / 1000 * maxT(); render(); };
+
+buildTabs(); buildTransitions(); resize(); render();
+</script>
+</body>
+</html>
